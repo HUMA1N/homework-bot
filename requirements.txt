@@ -1,0 +1,4 @@
+aiogram>=3.20,<4
+python-dotenv>=1.0
+# В Windows нет встроенной базы часовых поясов — она нужна для настройки TIMEZONE.
+tzdata; sys_platform == "win32"

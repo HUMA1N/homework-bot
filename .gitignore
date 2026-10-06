@@ -1,0 +1,13 @@
+# Секреты: токен бота хранится только здесь и в git не попадает
+.env
+
+# База с заданиями
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
