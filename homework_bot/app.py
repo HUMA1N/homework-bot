@@ -39,7 +39,10 @@ async def main(settings: Settings) -> None:
 
         reminders = asyncio.create_task(run_reminders(bot, db, settings))
         try:
-            await dp.start_polling(bot)
+            # Сообщения обрабатываем строго по очереди: иначе, например, фото из
+            # альбома или задание, отправленное сразу после расписания, могут
+            # обработаться раньше предыдущего сообщения.
+            await dp.start_polling(bot, handle_as_tasks=False)
         finally:
             reminders.cancel()
             with contextlib.suppress(asyncio.CancelledError):

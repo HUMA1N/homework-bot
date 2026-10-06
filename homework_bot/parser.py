@@ -14,14 +14,25 @@ from typing import Callable, Optional
 # Если предмет не удалось определить, задание попадает сюда.
 OTHER_SUBJECT = "Другое"
 
+# Расписание уроков: день недели (0 — понедельник) → предметы по порядку.
+Schedule = dict[int, list[str]]
+
+# Как получился срок задания (поле ParsedTask.due_rule).
+DUE_DATE = "date"          # срок взят из сообщения как есть
+DUE_LESSON = "lesson"      # поставлен на ближайший урок по расписанию
+DUE_MOVED = "moved"        # «на завтра», но завтра урока нет — перенесён на ближайший урок
+DUE_FALLBACK = "fallback"  # хотели ближайший урок, но предмета нет в расписании — завтра
+
 
 @dataclass(frozen=True)
 class ParsedTask:
     subject: str
     description: str
     due: date
-    # False — срок в сообщении не нашёлся и подставлен по умолчанию (завтра).
+    # False — срок в сообщении не нашёлся и подставлен по умолчанию
+    # (ближайший урок по расписанию или завтра).
     due_found: bool
+    due_rule: str = DUE_DATE
 
 
 # --------------------------------------------------------------------------
@@ -281,6 +292,38 @@ _DATE_RULES: list[tuple[re.Pattern[str], _Resolver]] = [
 ]
 
 
+# «к следующему уроку», «на след. урок», «к уроку», «на следующее занятие».
+_NEXT_LESSON_RE = re.compile(
+    rf"(?<!\w)(?:{_PREP}\s+)?(?:(?:следующ|ближайш)\w*|след\.?)\s+(?:урок|заняти)\w*(?!\w)"
+    rf"|(?<!\w)(?:к|на)\s+урок[уа]?(?!\w)",
+    re.IGNORECASE,
+)
+
+
+# --------------------------------------------------------------------------
+# Расписание
+# --------------------------------------------------------------------------
+def same_subject(a: str, b: str) -> bool:
+    return a.casefold() == b.casefold()
+
+
+def has_lessons(schedule: Optional[Schedule], subject: str) -> bool:
+    return bool(schedule) and any(
+        same_subject(s, subject) for lessons in schedule.values() for s in lessons
+    )
+
+
+def next_lesson(schedule: Optional[Schedule], subject: str, today: date) -> Optional[date]:
+    """Дата ближайшего урока по предмету после сегодняшнего дня (None — урока нет)."""
+    if not schedule:
+        return None
+    for days in range(1, 8):
+        day = today + timedelta(days=days)
+        if any(same_subject(s, subject) for s in schedule.get(day.weekday(), [])):
+            return day
+    return None
+
+
 # --------------------------------------------------------------------------
 # Разбор
 # --------------------------------------------------------------------------
@@ -288,8 +331,11 @@ def _cut(text: str, start: int, end: int) -> str:
     return f"{text[:start]} {text[end:]}"
 
 
-def _extract_date(text: str, today: date) -> tuple[Optional[date], str]:
-    """Находит самое левое упоминание срока и вырезает его из текста."""
+def _extract_date(text: str, today: date) -> tuple[Optional[date], str, str]:
+    """Находит самое левое упоминание срока и вырезает его из текста.
+
+    Возвращает срок, текст без него и сам найденный кусок текста.
+    """
     best: Optional[tuple[int, int, date]] = None
     for regex, resolve in _DATE_RULES:
         for m in regex.finditer(text):
@@ -300,9 +346,9 @@ def _extract_date(text: str, today: date) -> tuple[Optional[date], str]:
                 best = (m.start(), m.end(), due)
             break  # для этого правила нашли самое левое совпадение
     if best is None:
-        return None, text
+        return None, text, ""
     start, end, due = best
-    return due, _cut(text, start, end)
+    return due, _cut(text, start, end), text[start:end]
 
 
 def _extract_subject(text: str) -> tuple[Optional[str], str]:
@@ -338,18 +384,30 @@ def _guess_subject(text: str) -> tuple[str, str]:
     return OTHER_SUBJECT, text
 
 
-def parse_task(text: str, today: date) -> Optional[ParsedTask]:
-    """Разбирает одно задание. Возвращает None, если это не похоже на домашку."""
+def parse_task(
+    text: str, today: date, schedule: Optional[Schedule] = None
+) -> Optional[ParsedTask]:
+    """Разбирает одно задание. Возвращает None, если это не похоже на домашку.
+
+    schedule — расписание уроков. Если оно есть, задание без срока или
+    «к следующему уроку» ставится на ближайший урок по этому предмету.
+    """
     text = " ".join(text.split())
     if not text:
         return None
 
-    due, rest = _extract_date(text, today)
+    wants_lesson = False
+    m = _NEXT_LESSON_RE.search(text)
+    if m:
+        wants_lesson = True
+        text = _cut(text, m.start(), m.end())
+
+    due, rest, due_text = _extract_date(text, today)
     subject, rest = _extract_subject(rest)
 
     if subject is None:
         # Ни предмета, ни срока («привет», «спасибо») — это не задание.
-        if due is None:
+        if due is None and not wants_lesson:
             return None
         subject, rest = _guess_subject(_clean(rest))
 
@@ -357,15 +415,32 @@ def parse_task(text: str, today: date) -> Optional[ParsedTask]:
     if subject == OTHER_SUBJECT and not description:
         return None
 
+    tomorrow = today + timedelta(days=1)
+    rule = DUE_DATE
+    if due is None:
+        # Срока нет или «к следующему уроку» — ближайший урок, а без расписания завтра.
+        due = next_lesson(schedule, subject, today)
+        rule = DUE_LESSON
+        if due is None:
+            due, rule = tomorrow, DUE_FALLBACK
+    elif due == tomorrow and "завтр" in due_text.lower() and has_lessons(schedule, subject):
+        # «Алгебра на завтра» в пятницу: в субботу алгебры нет — ставим на понедельник.
+        lesson = next_lesson(schedule, subject, today)
+        if lesson is not None and lesson != tomorrow:
+            due, rule = lesson, DUE_MOVED
+
     return ParsedTask(
         subject=subject,
         description=description,
-        due=due if due is not None else today + timedelta(days=1),
-        due_found=due is not None,
+        due=due,
+        due_found=due_text != "" or wants_lesson,
+        due_rule=rule,
     )
 
 
-def parse_message(text: str, today: date) -> list[ParsedTask]:
+def parse_message(
+    text: str, today: date, schedule: Optional[Schedule] = None
+) -> list[ParsedTask]:
     """Разбирает сообщение целиком.
 
     Если каждая строка сообщения — отдельное задание («алгебра №245 на завтра»
@@ -374,8 +449,8 @@ def parse_message(text: str, today: date) -> list[ParsedTask]:
     """
     lines = [line for line in text.splitlines() if line.strip()]
     if len(lines) > 1:
-        tasks = [parse_task(line, today) for line in lines]
+        tasks = [parse_task(line, today, schedule) for line in lines]
         if all(tasks):
             return tasks  # type: ignore[return-value]
-    task = parse_task(text, today)
+    task = parse_task(text, today, schedule)
     return [task] if task else []

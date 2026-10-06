@@ -1,0 +1,42 @@
+# systemd-служба: бот работает круглосуточно, запускается при загрузке сервера
+# и перезапускается, если упал. Устанавливает её deploy/install.sh,
+# подробности — в DEPLOY.md.
+#
+# Если бот лежит не в /opt/homework-bot, install.sh сам подставит нужную папку.
+
+[Unit]
+Description=Homework Telegram bot
+Wants=network-online.target
+After=network-online.target
+# Не сдаваться: перезапускать сколько угодно раз (например, пока нет интернета).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=homework
+Group=homework
+WorkingDirectory=/opt/homework-bot
+ExecStart=/opt/homework-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+# База с заданиями — в /var/lib/homework-bot/homework.db.
+# systemd сам создаст эту папку и отдаст её пользователю homework.
+StateDirectory=homework-bot
+Environment=DB_PATH=/var/lib/homework-bot/homework.db
+Environment=PYTHONUNBUFFERED=1
+
+# Защита: бот может писать только в свою папку с базой.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

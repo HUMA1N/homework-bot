@@ -122,3 +122,109 @@ def test_render_fits_telegram_limits(db):
     assert len(text) < 4096
     assert buttons <= views.MAX_TASKS
     assert f"…и ещё {120 - buttons}" in text
+
+
+def test_old_database_gets_new_columns(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL,
+            subject TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            due_date TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO tasks (chat_id, subject, due_date, done) VALUES (42, 'Алгебра', '2026-10-05', 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db = Storage(path)
+    task = db.get_task(1)
+    assert task.done and task.photos == 0
+    # Отмеченное до обновления задание попадает в статистику по сроку сдачи.
+    assert db.done_by_subject(CHAT, TODAY - timedelta(days=6), TODAY) == [("Алгебра", 1)]
+    db.close()
+
+
+def test_done_by_subject_counts_by_done_day(db):
+    week_ago = TODAY - timedelta(days=7)
+    for subject, done_on in [
+        ("Алгебра", TODAY), ("Алгебра", TODAY - timedelta(days=6)),
+        ("История", TODAY), ("Физика", week_ago),
+    ]:
+        task = db.add_task(CHAT, subject, "", TODAY + timedelta(days=30))
+        db.set_done(task.id, True, on=done_on)
+    undone = db.add_task(CHAT, "Химия", "", TODAY)
+    db.set_done(undone.id, True, on=TODAY)
+    db.set_done(undone.id, False)
+
+    assert db.done_by_subject(CHAT, TODAY - timedelta(days=6), TODAY) == [
+        ("Алгебра", 2), ("История", 1)
+    ]
+
+
+def test_photos_are_counted_and_deleted_with_task(db):
+    from homework_bot.storage import MAX_PHOTOS_PER_TASK, Photo
+
+    task = db.add_task(CHAT, "Алгебра", "", TODAY)
+    db.add_photo(task.id, Photo("a"))
+    db.add_photo(task.id, Photo("b", "document"))
+    assert db.get_task(task.id).photos == 2
+    assert db.task_photos(task.id) == [Photo("a"), Photo("b", "document")]
+    for _ in range(MAX_PHOTOS_PER_TASK - 2):
+        assert db.add_photo(task.id, Photo("x"))
+    assert not db.add_photo(task.id, Photo("too many"))
+
+    db.delete_task(task.id)
+    assert db.task_photos(task.id) == []
+
+
+def test_pending_photos(db):
+    from homework_bot.storage import Photo
+
+    db.add_pending_photo(CHAT, Photo("a"))
+    db.add_pending_photo(CHAT + 1, Photo("other chat"))
+    assert db.pop_pending_photos(CHAT) == [Photo("a")]
+    assert db.pop_pending_photos(CHAT) == []
+    # Старые фото без подписи забываются.
+    db._conn.execute(
+        "INSERT INTO pending_photos (chat_id, file_id, created_at)"
+        " VALUES (?, 'old', datetime('now', '-2 days'))", (CHAT,)
+    )
+    assert db.pop_pending_photos(CHAT) == []
+
+
+def test_schedule_roundtrip(db):
+    db.set_schedule(CHAT, {0: ["Алгебра", "История"], 4: ["Физика"], 5: []})
+    assert db.get_schedule(CHAT) == {0: ["Алгебра", "История"], 4: ["Физика"]}
+    db.set_schedule(CHAT, {2: ["Химия"]})
+    assert db.get_schedule(CHAT) == {2: ["Химия"]}
+    assert db.get_schedule(CHAT + 1) == {}
+
+
+def test_list_shows_photo_button(db):
+    from homework_bot.storage import Photo
+
+    plain = db.add_task(CHAT, "Алгебра", "", TODAY)
+    with_photo = db.add_task(CHAT, "История", "", TODAY)
+    db.add_photo(with_photo.id, Photo("a"))
+    text, keyboard = views.render(views.TODAY, db.get_tasks(CHAT, [plain.id, with_photo.id]), TODAY)
+    assert "<b>История</b> 📷" in text
+    assert [[b.text for b in row] for row in keyboard.inline_keyboard] == [
+        ["✅ 1. Алгебра"], ["✅ 2. История", "📷 2"]
+    ]
+    assert views.task_ids_from_markup(keyboard) == [plain.id, with_photo.id]
+
+
+def test_render_stats():
+    text = views.render_stats([("Алгебра", 4), ("История", 1)], TODAY - timedelta(days=6), TODAY, 3, 1)
+    assert "30 сентября — 6 октября" in text
+    assert "Сделано заданий: <b>5</b>" in text
+    assert "▰▰▰▰▰▰▰▰▰▰ <b>Алгебра</b> — 4" in text
+    assert "▰▰ <b>История</b> — 1" in text
+    assert "Ещё не сделано: <b>3</b>, из них просрочено: <b>1</b>" in text

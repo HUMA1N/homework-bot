@@ -1,0 +1,58 @@
+name: Тесты
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Python ${{ matrix.python }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          # Большинство пользователей запускают бота на Windows.
+          - os: windows-latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Установить зависимости
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Проверить, что бот собирается
+        run: python -c "import bot, homework_bot.app"
+
+      - name: Запустить тесты
+        run: python -m pytest -v
+
+  deploy-files:
+    name: Скрипты и служба для VPS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Проверить shell-скрипты (shellcheck)
+        run: shellcheck deploy/*.sh
+
+      - name: Проверить файл службы systemd
+        run: |
+          # verify ругается только на то, что бота ещё нет в /opt/homework-bot,
+          # поэтому создаём заглушку на этом месте.
+          sudo mkdir -p /opt/homework-bot/.venv/bin
+          sudo ln -sf "$(command -v python3)" /opt/homework-bot/.venv/bin/python
+          sudo useradd --system homework
+          systemd-analyze verify deploy/homework-bot.service
